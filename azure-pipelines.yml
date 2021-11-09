@@ -1,0 +1,198 @@
+# Maven
+# Build your Java project and run tests with Apache Maven.
+# Add steps that analyze code, save build artifacts, deploy, and more:
+# https://docs.microsoft.com/azure/devops/pipelines/languages/java
+
+trigger:
+- master
+
+pool:
+  mrdreambot pipelines
+  
+variables:
+  DEV_PROJECT: dev-env
+  PROD_PROJECT: prod-env
+  APPNAME: kafka-sizing
+  TO_REGISTRY: default-route-openshift-image-registry.apps.cluster-wd7p6.wd7p6.sandbox1559.opentlc.com
+
+stages:
+- stage: CI
+  displayName: CI Stage
+  jobs:
+
+  - job: build
+    displayName: build
+    steps:
+    - task: CopyFiles@2
+      displayName: 'Copy manifest to staging area to be published'
+      inputs:
+        SourceFolder: 'openshift'
+        Contents: '**'
+        TargetFolder: '$(build.artifactstagingdirectory)/manifest'
+    - task: PublishBuildArtifacts@1
+      inputs:
+        PathtoPublish: '$(Build.ArtifactStagingDirectory)/manifest'
+        ArtifactName: 'manifest'
+        publishLocation: 'Container'
+    - task: oc-cmd@2
+      displayName: 'Login to Openshift'
+      inputs:
+        connectionType: 'OpenShift Connection Service'
+        openshiftService: 'rhpds'
+        cmd: 'status'
+        uselocalOc: true
+    - task: Bash@3
+      displayName: 'Create project and set roles to access registry'
+      inputs: 
+        targetType: 'inline'
+        script: |
+          # Make sure we give registry access to the user 
+          oc new-project $DEV_PROJECT
+          if [ $? -gt 0 ]; then
+            oc policy add-role-to-user registry-viewer $(oc whoami)
+            oc policy add-role-to-user registry-editor  $(oc whoami)
+          fi
+
+          mvn surefire-report:report
+          
+          mvn -Pprod compile jib:build -Dmaven.test.skip=true \
+            -Dimage=$TO_REGISTRY/$DEV_PROJECT/$APPNAME \
+            -Djib.from.auth.username=$MY_SECRET_FROM_USERNAME \
+            -Djib.from.auth.password=$MY_SECRET_FROM_PASSWORD \
+            -Djib.to.auth.username=$(oc whoami) \
+            -Djib.to.auth.password=$(oc whoami -t) \
+            -Djib.allowInsecureRegistries=true
+
+      env:
+        MY_SECRET_FROM_USERNAME: $(FROM_USERNAME)
+        MY_SECRET_FROM_PASSWORD: $(FROM_PASSWORD)
+    - task: PublishTestResults@2
+      inputs:
+        testResultsFormat: 'JUnit'
+        testResultsFiles: '**/TEST-*.xml'
+        testRunTitle: 'Kafka-sizing tests'
+- stage: CD_DEV
+  displayName: CD-DEV Stage
+  jobs:
+  - deployment: deploy
+    displayName: Deployment
+    environment: rhpds
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: replacetokens@4
+            displayName: 'Use token replacement to implement simple templating'
+            inputs:
+              targetFiles: '$(Pipeline.Workspace)/manifest/*.yaml'
+              encoding: 'auto'
+              tokenPattern: 'default'
+              writeBOM: true
+              actionOnMissing: 'warn'
+              keepToken: false
+              actionOnNoFiles: 'continue'
+              enableTransforms: false
+              useLegacyPattern: false
+              enableTelemetry: true
+              tokenPrefix: '#{'
+              tokenSuffix: '}#'
+          - task: oc-cmd@2
+            displayName: 'Change to target Openshift project'
+            inputs:
+              connectionType: 'OpenShift Connection Service'
+              openshiftService: 'rhpds'
+              cmd: 'project $(DEV_PROJECT)'
+              uselocalOc: true
+          - task: Bash@3
+            displayName: 'Create manifests'
+            inputs:
+              targetType: 'inline'
+              script: |
+                # Write your commands here
+                    
+                oc get dc | grep $APPNAME
+                if [ $? -gt 0 ]; then
+                  oc create -f $DIR/mysql-pv-claim.yaml
+                  oc create -f $DIR/mysql-deployment.yaml
+                  oc create -f $DIR/mysql-service.yaml
+                  oc create -f $DIR/app-deployment.yaml
+                  oc policy add-role-to-user view -z default
+                  oc get configmap
+                  oc create configmap $APPNAME --from-file=$DIR/application.properties
+                  oc get configmap
+                fi
+            env:
+              DIR: $(Pipeline.Workspace)/manifest
+          - task: Bash@3
+            displayName: 'Roll out deployment'
+            condition: succeededOrFailed()
+            inputs:
+              targetType: 'inline'
+              script: |
+                # Write your commands here
+                
+                oc rollout latest dc/$APPNAME
+- stage: CD_PROD
+  displayName: CD-PROD Stage
+  jobs:
+  - deployment: deploy
+    displayName: Deployment
+    environment: prod
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: replacetokens@4
+            displayName: 'Use token replacement to implement simple templating'
+            inputs:
+              targetFiles: '$(Pipeline.Workspace)/manifest/*.yaml'
+              encoding: 'auto'
+              tokenPattern: 'default'
+              writeBOM: true
+              actionOnMissing: 'warn'
+              keepToken: false
+              actionOnNoFiles: 'continue'
+              enableTransforms: false
+              useLegacyPattern: false
+              enableTelemetry: true
+              tokenPrefix: '#{'
+              tokenSuffix: '}#'
+          - task: oc-cmd@2
+            displayName: 'Login to Openshift'
+            inputs:
+              connectionType: 'OpenShift Connection Service'
+              openshiftService: 'rhpds'
+              cmd: 'status'
+              uselocalOc: true
+          - task: Bash@3
+            displayName: 'Create manifests'
+            inputs:
+              targetType: 'inline'
+              script: |
+                # Write your commands here
+                oc project $PROD_PROJECT
+                if [ $? -gt 0 ]; then
+                  oc new-project $PROD_PROJECT
+                fi
+
+                oc get dc | grep $APPNAME
+                if [ $? -gt 0 ]; then
+                  oc create -f $DIR/mysql-pv-claim.yaml
+                  oc create -f $DIR/mysql-deployment.yaml
+                  oc create -f $DIR/mysql-service.yaml
+                  oc create -f $DIR/app-deployment.yaml
+                  oc policy add-role-to-user view -z default
+                  oc create configmap $APPNAME --from-file=$DIR/application.properties
+                  cat $DIR/app-deployment.yaml
+                fi
+            env:
+              DIR: $(Pipeline.Workspace)/manifest
+          - task: Bash@3
+            displayName: 'Roll out deployment'
+            condition: succeededOrFailed()
+            inputs:
+              targetType: 'inline'
+              script: |
+                # Write your commands here
+                oc tag $DEV_PROJECT/$APPNAME:latest $PROD_PROJECT/$APPNAME:latest
+                oc rollout latest dc/$APPNAME
